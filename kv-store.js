@@ -15,8 +15,6 @@ class KVStore {
             fs.mkdirSync(SSTABLE_DIR);
         }
 
-        this.sstableCount = 0;
-
         this.recover();
     }
 
@@ -68,6 +66,7 @@ class KVStore {
             key
         });
 
+        // null represents a tombstone
         this.memtable.set(key, null);
 
         if (this.memtable.size >= MAX_MEMTABLE_SIZE) {
@@ -88,14 +87,14 @@ class KVStore {
     }
 
     // -------------------------
-    // Flush Memtable
+    // Flush Memtable → SSTable
     // -------------------------
 
     flushMemtable() {
 
         const entries = [...this.memtable.entries()];
 
-        // Sort by key
+        // SSTables are sorted by key
         entries.sort((a, b) =>
             a[0].localeCompare(b[0])
         );
@@ -120,16 +119,105 @@ class KVStore {
 
         // In a real database we'd also
         // rotate/truncate the WAL here.
+
+        // After creating enough SSTables,
+        // compact them.
+        this.compact();
     }
 
     // -------------------------
-    // Read SSTables
+    // COMPACTION
+    // -------------------------
+
+    compact() {
+        const files = fs
+            .readdirSync(SSTABLE_DIR)
+            .filter(file => file.endsWith(".data"))
+            .sort();
+
+        // Nothing to compact
+        if (files.length <= 1) {
+            return;
+        }
+
+        console.log(
+            `Compacting ${files.length} SSTables...`
+        );
+
+        /*
+         * Map stores the latest value.
+         *
+         * We process SSTables from oldest → newest.
+         * Therefore newer values overwrite older ones.
+         */
+        const merged = new Map();
+
+        for (const file of files) {
+            const filepath = `${SSTABLE_DIR}/${file}`;
+
+            const content = fs.readFileSync(
+                filepath,
+                "utf8"
+            );
+
+            const lines = content
+                .split("\n")
+                .filter(Boolean);
+
+            for (const line of lines) {
+                const [key, value] = line.split("\t");
+
+                merged.set(key, value);
+            }
+        }
+
+        // Remove tombstones
+        for (const [key, value] of merged) {
+            if (value === "null") {
+                merged.delete(key);
+            }
+        }
+
+        // Sort final data
+        const entries = [...merged.entries()].sort(
+            (a, b) => a[0].localeCompare(b[0])
+        );
+
+        let content = "";
+
+        for (const [key, value] of entries) {
+            content += `${key}\t${value}\n`;
+        }
+
+        const compactedFile =
+            `${SSTABLE_DIR}/sstable-${Date.now()}-compacted.data`;
+
+        fs.writeFileSync(
+            compactedFile,
+            content
+        );
+
+        // Delete old SSTables
+        for (const file of files) {
+            fs.unlinkSync(
+                `${SSTABLE_DIR}/${file}`
+            );
+        }
+
+        console.log(
+            `Compaction complete → ${compactedFile}`
+        );
+    }
+
+    // -------------------------
+    // Read from SSTables
     // -------------------------
 
     getFromSSTables(key) {
 
         const files = fs
             .readdirSync(SSTABLE_DIR)
+            .filter(file => file.endsWith(".data"))
             .sort()
             .reverse();
 
@@ -173,10 +261,10 @@ class KVStore {
             return;
         }
 
-        const file =
+        const content =
             fs.readFileSync(WAL_FILE, "utf8");
 
-        const lines = file
+        const lines = content
             .split("\n")
             .filter(Boolean);
 
