@@ -107,41 +107,42 @@ class KVStore {
 
     const bloomFile = `${SSTABLE_DIR}/sstable-${timestamp}.bloom`;
 
-    // -------------------------
-    // Create Bloom Filter
-    // -------------------------
+    const bloomFilter = new BloomFilter(Math.max(1000, entries.length * 10), 3);
 
-    const bloomFilter = new BloomFilter(1000, 3);
-
-    // -------------------------
-    // Create SSTable + Index
-    // -------------------------
-
-    let data = "";
     const index = [];
 
-    for (let i = 0; i < entries.length; i++) {
-      const [key, value] = entries[i];
+    let offset = 0;
 
-      // Add key to Bloom Filter
-      bloomFilter.add(key);
+    const fd = fs.openSync(dataFile, "w");
 
-      // Sparse index
-      if (i % INDEX_INTERVAL === 0) {
-        index.push({
-          key,
-          position: i,
-        });
+    try {
+      for (let i = 0; i < entries.length; i++) {
+        const [key, value] = entries[i];
+
+        bloomFilter.add(key);
+
+        // Add every 2nd key to sparse index
+        if (i % INDEX_INTERVAL === 0) {
+          index.push({
+            key,
+            offset,
+          });
+        }
+
+        const line = `${key}\t${value}\n`;
+
+        const buffer = Buffer.from(line);
+
+        fs.writeSync(fd, buffer);
+
+        // Move offset forward
+        offset += buffer.length;
       }
 
-      data += `${key}\t${value}\n`;
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
     }
-
-    // -------------------------
-    // Write files
-    // -------------------------
-
-    fs.writeFileSync(dataFile, data);
 
     fs.writeFileSync(indexFile, JSON.stringify(index));
 
@@ -161,7 +162,7 @@ class KVStore {
 
   getFromSSTable(key, dataFile, indexFile, bloomFile) {
     // -------------------------
-    // Load Bloom Filter
+    // Bloom Filter
     // -------------------------
 
     const bloomData = JSON.parse(fs.readFileSync(bloomFile, "utf8"));
@@ -170,53 +171,66 @@ class KVStore {
 
     bloomFilter.bits = bloomData.bits;
 
-    // -------------------------
-    // Bloom Filter check
-    // -------------------------
-
     if (!bloomFilter.mightContain(key)) {
-      console.log(`Bloom Filter: ${key} definitely not here`);
-
       return undefined;
     }
 
-    console.log(`Bloom Filter: ${key} might exist`);
-
     // -------------------------
-    // Load Index
+    // Index
     // -------------------------
 
     const index = JSON.parse(fs.readFileSync(indexFile, "utf8"));
 
-    let startPosition = 0;
+    let offset = 0;
 
     for (const entry of index) {
       if (entry.key <= key) {
-        startPosition = entry.position;
+        offset = entry.offset;
       } else {
         break;
       }
     }
 
     // -------------------------
-    // Search SSTable
+    // Read SSTable
     // -------------------------
 
-    const lines = fs.readFileSync(dataFile, "utf8").split("\n").filter(Boolean);
+    const fd = fs.openSync(dataFile, "r");
 
-    for (let i = startPosition; i < lines.length; i++) {
-      const [storedKey, value] = lines[i].split("\t");
+    try {
+      const stats = fs.fstatSync(fd);
 
-      if (storedKey === key) {
-        return value === "null" ? undefined : value;
+      const fileSize = stats.size;
+
+      // Read from our indexed position
+      const bytesToRead = fileSize - offset;
+
+      const buffer = Buffer.alloc(bytesToRead);
+
+      fs.readSync(fd, buffer, 0, bytesToRead, offset);
+
+      const data = buffer.toString("utf8");
+
+      const lines = data.split("\n").filter(Boolean);
+
+      for (const line of lines) {
+        const [storedKey, value] = line.split("\t");
+
+        if (storedKey === key) {
+          return value === "null" ? undefined : value;
+        }
+
+        // Since SSTable is sorted,
+        // we can stop once we've passed key.
+        if (storedKey > key) {
+          return undefined;
+        }
       }
 
-      if (storedKey > key) {
-        break;
-      }
+      return undefined;
+    } finally {
+      fs.closeSync(fd);
     }
-
-    return undefined;
   }
   // -------------------------
   // WAL Rotation
