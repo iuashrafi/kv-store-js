@@ -1,5 +1,5 @@
 const fs = require("fs");
-
+const BloomFilter = require("./BloomFilter");
 const WAL_FILE = "./store.log";
 const SSTABLE_DIR = "./sstables";
 
@@ -105,13 +105,28 @@ class KVStore {
 
     const indexFile = `${SSTABLE_DIR}/sstable-${timestamp}.index`;
 
+    const bloomFile = `${SSTABLE_DIR}/sstable-${timestamp}.bloom`;
+
+    // -------------------------
+    // Create Bloom Filter
+    // -------------------------
+
+    const bloomFilter = new BloomFilter(1000, 3);
+
+    // -------------------------
+    // Create SSTable + Index
+    // -------------------------
+
     let data = "";
     const index = [];
 
     for (let i = 0; i < entries.length; i++) {
       const [key, value] = entries[i];
 
-      // Add sparse index entry
+      // Add key to Bloom Filter
+      bloomFilter.add(key);
+
+      // Sparse index
       if (i % INDEX_INTERVAL === 0) {
         index.push({
           key,
@@ -122,21 +137,59 @@ class KVStore {
       data += `${key}\t${value}\n`;
     }
 
+    // -------------------------
+    // Write files
+    // -------------------------
+
     fs.writeFileSync(dataFile, data);
 
     fs.writeFileSync(indexFile, JSON.stringify(index));
+
+    fs.writeFileSync(
+      bloomFile,
+      JSON.stringify({
+        size: bloomFilter.size,
+        hashCount: bloomFilter.hashCount,
+        bits: bloomFilter.bits,
+      }),
+    );
 
     this.memtable.clear();
 
     this.rotateWAL();
   }
 
-  getFromSSTable(key, dataFile, indexFile) {
+  getFromSSTable(key, dataFile, indexFile, bloomFile) {
+    // -------------------------
+    // Load Bloom Filter
+    // -------------------------
+
+    const bloomData = JSON.parse(fs.readFileSync(bloomFile, "utf8"));
+
+    const bloomFilter = new BloomFilter(bloomData.size, bloomData.hashCount);
+
+    bloomFilter.bits = bloomData.bits;
+
+    // -------------------------
+    // Bloom Filter check
+    // -------------------------
+
+    if (!bloomFilter.mightContain(key)) {
+      console.log(`Bloom Filter: ${key} definitely not here`);
+
+      return undefined;
+    }
+
+    console.log(`Bloom Filter: ${key} might exist`);
+
+    // -------------------------
+    // Load Index
+    // -------------------------
+
     const index = JSON.parse(fs.readFileSync(indexFile, "utf8"));
 
     let startPosition = 0;
 
-    // Find closest index entry
     for (const entry of index) {
       if (entry.key <= key) {
         startPosition = entry.position;
@@ -145,9 +198,12 @@ class KVStore {
       }
     }
 
+    // -------------------------
+    // Search SSTable
+    // -------------------------
+
     const lines = fs.readFileSync(dataFile, "utf8").split("\n").filter(Boolean);
 
-    // Only search from the indexed position
     for (let i = startPosition; i < lines.length; i++) {
       const [storedKey, value] = lines[i].split("\t");
 
@@ -155,7 +211,6 @@ class KVStore {
         return value === "null" ? undefined : value;
       }
 
-      // We've passed the key
       if (storedKey > key) {
         break;
       }
@@ -163,7 +218,6 @@ class KVStore {
 
     return undefined;
   }
-
   // -------------------------
   // WAL Rotation
   // -------------------------
