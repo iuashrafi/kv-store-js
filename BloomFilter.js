@@ -1,4 +1,4 @@
-export class BloomFilter {
+class BloomFilter {
   constructor(size = 1000, hashCount = 3) {
     this.size = size;
     this.hashCount = hashCount;
@@ -40,3 +40,5 @@ export class BloomFilter {
     return true;
   }
 }
+
+module.exports = BloomFilter;

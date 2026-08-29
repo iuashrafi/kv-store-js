@@ -4,6 +4,11 @@ const WAL_FILE = "./store.log";
 const SSTABLE_DIR = "./sstables";
 
 const MAX_MEMTABLE_SIZE = 3;
+const INDEX_INTERVAL = 2;
+const COMPACTION_THRESHOLD = 3;
+
+const NOT_FOUND = Symbol("not_found");
+const TOMBSTONE = Symbol("tombstone");
 
 class KVStore {
   constructor() {
@@ -48,6 +53,29 @@ class KVStore {
       const value = this.memtable.get(key);
 
       return value === null ? undefined : value;
+    }
+
+    // Fall back to SSTables, newest first
+    const files = fs
+      .readdirSync(SSTABLE_DIR)
+      .filter((file) => file.endsWith(".data"))
+      .sort()
+      .reverse();
+
+    for (const file of files) {
+      const base = file.slice(0, -".data".length);
+
+      const dataFile = `${SSTABLE_DIR}/${base}.data`;
+      const indexFile = `${SSTABLE_DIR}/${base}.index`;
+      const bloomFile = `${SSTABLE_DIR}/${base}.bloom`;
+
+      const result = this.getFromSSTable(key, dataFile, indexFile, bloomFile);
+
+      if (result === NOT_FOUND) {
+        continue;
+      }
+
+      return result === TOMBSTONE ? undefined : result;
     }
 
     return undefined;
@@ -158,6 +186,119 @@ class KVStore {
     this.memtable.clear();
 
     this.rotateWAL();
+
+    const sstableCount = fs
+      .readdirSync(SSTABLE_DIR)
+      .filter((file) => file.endsWith(".data")).length;
+
+    if (sstableCount > COMPACTION_THRESHOLD) {
+      this.compact();
+    }
+  }
+
+  // -------------------------
+  // Compaction
+  // -------------------------
+
+  compact() {
+    const files = fs
+      .readdirSync(SSTABLE_DIR)
+      .filter((file) => file.endsWith(".data"))
+      .sort();
+
+    if (files.length <= 1) {
+      return;
+    }
+
+    console.log(`Compacting ${files.length} SSTables...`);
+
+    // Oldest → newest, so newer values overwrite older ones
+    const merged = new Map();
+
+    for (const file of files) {
+      const content = fs.readFileSync(`${SSTABLE_DIR}/${file}`, "utf8");
+
+      const lines = content.split("\n").filter(Boolean);
+
+      for (const line of lines) {
+        const [key, value] = line.split("\t");
+
+        merged.set(key, value);
+      }
+    }
+
+    // Drop tombstones — no later SSTable can resurrect them
+    for (const [key, value] of merged) {
+      if (value === "null") {
+        merged.delete(key);
+      }
+    }
+
+    const entries = [...merged.entries()].sort((a, b) =>
+      a[0].localeCompare(b[0]),
+    );
+
+    const timestamp = Date.now();
+
+    const dataFile = `${SSTABLE_DIR}/sstable-${timestamp}-compacted.data`;
+    const indexFile = `${SSTABLE_DIR}/sstable-${timestamp}-compacted.index`;
+    const bloomFile = `${SSTABLE_DIR}/sstable-${timestamp}-compacted.bloom`;
+
+    const bloomFilter = new BloomFilter(Math.max(1000, entries.length * 10), 3);
+
+    const index = [];
+
+    let offset = 0;
+
+    const fd = fs.openSync(dataFile, "w");
+
+    try {
+      for (let i = 0; i < entries.length; i++) {
+        const [key, value] = entries[i];
+
+        bloomFilter.add(key);
+
+        if (i % INDEX_INTERVAL === 0) {
+          index.push({ key, offset });
+        }
+
+        const buffer = Buffer.from(`${key}\t${value}\n`);
+
+        fs.writeSync(fd, buffer);
+
+        offset += buffer.length;
+      }
+
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    fs.writeFileSync(indexFile, JSON.stringify(index));
+
+    fs.writeFileSync(
+      bloomFile,
+      JSON.stringify({
+        size: bloomFilter.size,
+        hashCount: bloomFilter.hashCount,
+        bits: bloomFilter.bits,
+      }),
+    );
+
+    // Remove the superseded SSTables (data + index + bloom)
+    for (const file of files) {
+      const base = file.slice(0, -".data".length);
+
+      for (const ext of [".data", ".index", ".bloom"]) {
+        const filepath = `${SSTABLE_DIR}/${base}${ext}`;
+
+        if (fs.existsSync(filepath)) {
+          fs.unlinkSync(filepath);
+        }
+      }
+    }
+
+    console.log(`Compaction complete → ${dataFile}`);
   }
 
   getFromSSTable(key, dataFile, indexFile, bloomFile) {
@@ -172,7 +313,7 @@ class KVStore {
     bloomFilter.bits = bloomData.bits;
 
     if (!bloomFilter.mightContain(key)) {
-      return undefined;
+      return NOT_FOUND;
     }
 
     // -------------------------
@@ -217,17 +358,17 @@ class KVStore {
         const [storedKey, value] = line.split("\t");
 
         if (storedKey === key) {
-          return value === "null" ? undefined : value;
+          return value === "null" ? TOMBSTONE : value;
         }
 
         // Since SSTable is sorted,
         // we can stop once we've passed key.
         if (storedKey > key) {
-          return undefined;
+          return NOT_FOUND;
         }
       }
 
-      return undefined;
+      return NOT_FOUND;
     } finally {
       fs.closeSync(fd);
     }
@@ -280,3 +421,5 @@ class KVStore {
     }
   }
 }
+
+module.exports = KVStore;
