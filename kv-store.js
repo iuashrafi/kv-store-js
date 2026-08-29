@@ -48,11 +48,14 @@ class KVStore {
 
         // First check latest data
         if (this.memtable.has(key)) {
-            return this.memtable.get(key);
+            const value = this.memtable.get(key);
+
+            return value === null
+                ? undefined
+                : value;
         }
 
-        // Then check SSTables
-        return this.getFromSSTables(key);
+        return undefined;
     }
 
     // -------------------------
@@ -80,10 +83,28 @@ class KVStore {
 
     appendToWAL(operation) {
 
-        fs.appendFileSync(
+        const fd = fs.openSync(
             WAL_FILE,
-            JSON.stringify(operation) + "\n"
+            "a"
         );
+
+        try {
+
+            const data =
+                JSON.stringify(operation) + "\n";
+
+            fs.writeSync(
+                fd,
+                data
+            );
+
+            // Make sure WAL reaches disk
+            fs.fsyncSync(fd);
+
+        } finally {
+
+            fs.closeSync(fd);
+        }
     }
 
     // -------------------------
@@ -102,153 +123,73 @@ class KVStore {
         const filename =
             `${SSTABLE_DIR}/sstable-${Date.now()}.data`;
 
-        let content = "";
-
-        for (const [key, value] of entries) {
-            content += `${key}\t${value}\n`;
-        }
-
-        fs.writeFileSync(filename, content);
-
-        console.log(
-            `Memtable flushed → ${filename}`
+        const fd = fs.openSync(
+            filename,
+            "w"
         );
 
-        // Clear memory
+        try {
+
+            for (const [key, value] of entries) {
+
+                const line =
+                    `${key}\t${value}\n`;
+
+                fs.writeSync(
+                    fd,
+                    line
+                );
+            }
+
+            // IMPORTANT:
+            // Make SSTable durable
+            fs.fsyncSync(fd);
+
+        } finally {
+
+            fs.closeSync(fd);
+        }
+
+        console.log(
+            `SSTable safely written → ${filename}`
+        );
+
+        // Only after SSTable is durable
+        // do we clear the Memtable.
         this.memtable.clear();
 
-        // In a real database we'd also
-        // rotate/truncate the WAL here.
-
-        // After creating enough SSTables,
-        // compact them.
-        this.compact();
+        // Now WAL entries represented by
+        // this SSTable are no longer required.
+        this.rotateWAL();
     }
 
     // -------------------------
-    // COMPACTION
+    // WAL Rotation
     // -------------------------
 
-    compact() {
-        const files = fs
-            .readdirSync(SSTABLE_DIR)
-            .filter(file => file.endsWith(".data"))
-            .sort();
+    rotateWAL() {
 
-        // Nothing to compact
-        if (files.length <= 1) {
+        if (!fs.existsSync(WAL_FILE)) {
             return;
         }
 
-        console.log(
-            `Compacting ${files.length} SSTables...`
+        const oldWAL =
+            `${WAL_FILE}.old`;
+
+        // Remove previous backup
+        if (fs.existsSync(oldWAL)) {
+            fs.unlinkSync(oldWAL);
+        }
+
+        // Rename current WAL
+        fs.renameSync(
+            WAL_FILE,
+            oldWAL
         );
-
-        /*
-         * Map stores the latest value.
-         *
-         * We process SSTables from oldest → newest.
-         * Therefore newer values overwrite older ones.
-         */
-        const merged = new Map();
-
-        for (const file of files) {
-            const filepath = `${SSTABLE_DIR}/${file}`;
-
-            const content = fs.readFileSync(
-                filepath,
-                "utf8"
-            );
-
-            const lines = content
-                .split("\n")
-                .filter(Boolean);
-
-            for (const line of lines) {
-                const [key, value] = line.split("\t");
-
-                merged.set(key, value);
-            }
-        }
-
-        // Remove tombstones
-        for (const [key, value] of merged) {
-            if (value === "null") {
-                merged.delete(key);
-            }
-        }
-
-        // Sort final data
-        const entries = [...merged.entries()].sort(
-            (a, b) => a[0].localeCompare(b[0])
-        );
-
-        let content = "";
-
-        for (const [key, value] of entries) {
-            content += `${key}\t${value}\n`;
-        }
-
-        const compactedFile =
-            `${SSTABLE_DIR}/sstable-${Date.now()}-compacted.data`;
-
-        fs.writeFileSync(
-            compactedFile,
-            content
-        );
-
-        // Delete old SSTables
-        for (const file of files) {
-            fs.unlinkSync(
-                `${SSTABLE_DIR}/${file}`
-            );
-        }
 
         console.log(
-            `Compaction complete → ${compactedFile}`
+            "WAL rotated"
         );
-    }
-
-    // -------------------------
-    // Read from SSTables
-    // -------------------------
-
-    getFromSSTables(key) {
-
-        const files = fs
-            .readdirSync(SSTABLE_DIR)
-            .filter(file => file.endsWith(".data"))
-            .sort()
-            .reverse();
-
-        for (const file of files) {
-
-            const content = fs.readFileSync(
-                `${SSTABLE_DIR}/${file}`,
-                "utf8"
-            );
-
-            const lines = content
-                .split("\n")
-                .filter(Boolean);
-
-            for (const line of lines) {
-
-                const [storedKey, value] =
-                    line.split("\t");
-
-                if (storedKey === key) {
-
-                    if (value === "null") {
-                        return undefined;
-                    }
-
-                    return value;
-                }
-            }
-        }
-
-        return undefined;
     }
 
     // -------------------------
@@ -262,11 +203,15 @@ class KVStore {
         }
 
         const content =
-            fs.readFileSync(WAL_FILE, "utf8");
+            fs.readFileSync(
+                WAL_FILE,
+                "utf8"
+            );
 
-        const lines = content
-            .split("\n")
-            .filter(Boolean);
+        const lines =
+            content
+                .split("\n")
+                .filter(Boolean);
 
         for (const line of lines) {
 
@@ -274,6 +219,7 @@ class KVStore {
                 JSON.parse(line);
 
             if (operation.operation === "SET") {
+
                 this.memtable.set(
                     operation.key,
                     operation.value
@@ -281,6 +227,7 @@ class KVStore {
             }
 
             if (operation.operation === "DELETE") {
+
                 this.memtable.set(
                     operation.key,
                     null
